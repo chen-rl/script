@@ -1,12 +1,13 @@
 #!/bin/bash
 
-# 作者: 测试部
+# 作者: chenrl
 # 创建日期: 2024-07-12
-# 修改日期：2024-07-15
-# 版本: 1.3
+# 修改日期：2024-08-16
+# 版本: 1.0.3
 # 版本变更：
 #       1.scp修改为rsync
 #       2.ssh增加持久化
+#       3.增加镜像更新
 # 描述: 此脚本管理各种组件（stream、agent、manage-shell、screen、input）的构建和部署，
 #       用于指定的分支或远程IP地址。现在支持从文件读取IP并多线程批量更新设备上的程序。
 
@@ -41,15 +42,19 @@ show_help() {
     echo "  agent     arm-agent程序"
     echo "  manage    manage-shell脚本"
     echo "  screen    arm-screen程序"
+    echo "  input     input-device服务"
+    echo "  img       镜像更新"
     echo "  all       更新远程设备上的所有程序"
     echo
     echo "子命令:"
     echo "  m <分支>         更新git分支并打包编译"
     echo "  u <ip或IP文件>   更新远程设备上的程序"
+    echo "  img <ip或IP文件> <镜像文件>   更新远程设备上的镜像"
     echo
     echo "示例:"
     echo "  $0 stream m master          从master分支更新并生成arm-stream程序"
     echo "  $0 agent u 192.168.1.100    更新远程设备IP为192.168.1.100上的agent程序"
+    echo "  $0 img u 192.168.1.100 /path/to/local_image.tgz   更新远程设备IP为192.168.1.100上的镜像"
     echo "  $0 all u ip_list.txt        从ip_list.txt文件中读取IP并更新所有设备上的程序"
     echo
     exit 1
@@ -91,7 +96,9 @@ update_program() {
     fi
     rsync -avz -e "sshpass -p 'root' ssh -o ControlMaster=auto -o ControlPath=/tmp/ssh-%r@%h:%p -o ControlPersist=600" "${local_file}" "root@${ip}:${remote_path}" | tee -a "${LOG_FILE}"
     #sshpass -p 'root' scp -rf "${local_file}" root@"${ip}:${remote_path}"
-    if [ "${link_name}" != "manage-shell" ]; then
+    if [ "${link_name}" == "libmedia_server.so" ]; then
+        sshpass -p 'root' ssh -o ControlMaster=auto -o ControlPath=/tmp/ssh-%r@%h:%p -o ControlPersist=600 root@"${ip}"  "ln -snf ${remote_path}libmedia_server.so.1 ${remote_path}${link_name} ; ln -snf ${remote_path}$(basename ${local_file}) ${remote_path}libmedia_server.so.1" | tee -a "${LOG_FILE}"
+    elif [ "${link_name}" != "manage-shell" ]; then
     	sshpass -p 'root' ssh -o ControlMaster=auto -o ControlPath=/tmp/ssh-%r@%h:%p -o ControlPersist=600 root@"${ip}"  "ln -snf ${remote_path}$(basename ${local_file}) ${remote_path}${link_name}" | tee -a "${LOG_FILE}"
     fi
     if [ -n "${start_command}" ]; then
@@ -136,6 +143,47 @@ update_from_file_parallel() {
         if [ -n "${ip}" ]; then
             (
                 update_program "${ip}" "${remote_path}" "${local_file}" "${link_name}" "${stop_command}" "${start_command}"
+            ) &
+        fi
+    done < "${file}"
+    wait
+}
+
+# 更新镜像
+update_image() {
+    local ip=$1
+    local local_image_file=$2
+
+    # 停止 agent，停止容器，删除容器，删除已挂载镜像，删除目标 IP目录下的镜像文件
+    sshpass -p 'root' ssh -o ControlMaster=auto -o ControlPath=/tmp/ssh-%r@%h:%p -o ControlPersist=600 root@"${ip}" "systemctl stop arm-agent ; docker stop \$(docker ps -aq) ; docker rm \$(docker ps -aq) ; docker rmi \$(docker images -aq) ; rm /data/rk3588_docker-android10-user-super.img*"
+
+    # 将镜像移动到目标物理机
+    sshpass -p 'root' scp -r "${local_image_file}" root@"${ip}:/data/"
+
+    # 镜像名获取
+    local filename=$(sshpass -p 'root' ssh -o ControlMaster=auto -o ControlPath=/tmp/ssh-%r@%h:%p -o ControlPersist=600 root@"${ip}" 'ls -t /data/*.tgz | head -1')
+
+    # 使用 manage-shell 脚本创建镜像
+    sshpass -p 'root' ssh -o ControlMaster=auto -o ControlPath=/tmp/ssh-%r@%h:%p -o ControlPersist=600 root@"${ip}" "/userdata/arm-agent/bin/manage-shell/android_ctl.sh createImage ${filename}"
+
+    # 将最新创建的镜像名更新到 conf/manage-shell/android_common.conf 中
+    sshpass -p 'root' ssh -o ControlMaster=auto -o ControlPath=/tmp/ssh-%r@%h:%p -o ControlPersist=600 root@"${ip}" "sed -i 's/.*image=.*//' /userdata/arm-agent/conf/manage-shell/android_common.conf"
+
+    # 启动 agent
+    sshpass -p 'root' ssh -o ControlMaster=auto -o ControlPath=/tmp/ssh-%r@%h:%p -o ControlPersist=600 root@"${ip}" "systemctl start arm-agent"
+
+    log_info "镜像更新完成: ${local_image_file} 到 ${ip}"
+}
+
+# 批量更新镜像
+update_images_batch() {
+    local file=$1
+    local local_image_file=$2
+
+    while IFS= read -r ip; do
+        if [ -n "${ip}" ]; then
+            (
+                update_image "${ip}" "${local_image_file}"
             ) &
         fi
     done < "${file}"
@@ -231,6 +279,20 @@ case "$1" in
                     update_from_file_parallel "$3" "/userdata/arm-agent/bin/" "${FILE_INPUT}" "input-dev-server" "" "systemctl restart input-device"
                 else
                     update_program "$3" "/userdata/arm-agent/bin/" "${FILE_INPUT}" "input-dev-server" "" "systemctl restart input-device"
+                fi
+                ;;
+            *)
+                show_help
+                ;;
+        esac
+        ;;
+    img)
+        case "$2" in
+            u)
+                if [ -f "$3" ]; then
+                    update_images_batch "$3" "$4"
+                else
+                    update_image "$3" "$4"
                 fi
                 ;;
             *)
